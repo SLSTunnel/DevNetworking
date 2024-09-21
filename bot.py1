@@ -1,0 +1,247 @@
+import logging
+import asyncio
+import requests
+import websocket
+import time
+import socket
+from urllib.parse import urlparse
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, ConversationHandler, CallbackQueryHandler, MessageHandler, filters
+
+# Configure logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Your Telegram Bot Token
+TELEGRAM_BOT_TOKEN = "7981996805:AAEhie3ojsq3eo8N64ALQmYbUe63IGDXxxQ"
+
+class ConnectionChecker:
+    def __init__(self, host):
+        if not (host.startswith("http://") or host.startswith("https://") or host.startswith("wss://")):
+            raise ValueError("Host must start with 'http://', 'https://', or 'wss://'")
+        self.host = host
+
+    async def check_direct(self):
+        try:
+            start_time = time.time()
+            async with asyncio.timeout(5):
+                response = await asyncio.to_thread(requests.get, self.host)
+            elapsed_time = time.time() - start_time
+            return response.status_code in [200, 101], elapsed_time
+        except Exception as e:
+            logger.error(f"Direct check failed: {e}")
+            return False, None
+
+    async def check_ws(self):
+        ws_url = self.host.replace("http://", "ws://").replace("https://", "wss://")
+        try:
+            start_time = time.time()
+            async with asyncio.timeout(5):
+                ws = await asyncio.to_thread(websocket.create_connection, ws_url)
+            elapsed_time = time.time() - start_time
+            ws.close()
+            return True, elapsed_time
+        except Exception as e:
+            logger.error(f"WebSocket check failed: {e}")
+            return False, None
+
+    async def check_sni(self):
+        return await self.check_direct()
+
+    async def check_proxy(self, proxy_url):
+        try:
+            start_time = time.time()
+            async with asyncio.timeout(5):
+                response = await asyncio.to_thread(requests.get, self.host, proxies={"http": proxy_url, "https": proxy_url})
+            elapsed_time = time.time() - start_time
+            return response.status_code in [200, 101], elapsed_time
+        except Exception as e:
+            logger.error(f"Proxy check failed: {e}")
+            return False, None
+
+    async def get_isp(self):
+        try:
+            ip_address = socket.gethostbyname(urlparse(self.host).netloc)
+            async with asyncio.timeout(5):
+                response = await asyncio.to_thread(requests.get, f"https://ipinfo.io/{ip_address}/json")
+            data = response.json()
+            return data.get('org', 'ISP information not available')
+        except Exception as e:
+            logger.error(f"ISP check failed: {e}")
+            return "Could not retrieve ISP information"
+
+    async def check_v2ray(self, v2ray_host, v2ray_port):
+        try:
+            start_time = time.time()
+            async with asyncio.timeout(5):
+                reader, writer = await asyncio.open_connection(v2ray_host, v2ray_port)
+                writer.write(b'\x00')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+            elapsed_time = time.time() - start_time
+            return True, elapsed_time
+        except Exception as e:
+            logger.error(f"V2Ray check failed: {e}")
+            return False, None
+
+# Define conversation states
+HOST, PROXY, V2RAY = range(3)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [
+        [InlineKeyboardButton("Check All", callback_data='check_all')],
+        [InlineKeyboardButton("Direct", callback_data='direct'),
+         InlineKeyboardButton("WebSocket", callback_data='ws'),
+         InlineKeyboardButton("SNI", callback_data='sni')],
+        [InlineKeyboardButton("Proxy", callback_data='proxy'),
+         InlineKeyboardButton("V2Ray", callback_data='v2ray'),
+         InlineKeyboardButton("ISP", callback_data='isp')],
+        [InlineKeyboardButton("Help", callback_data='help')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "Welcome to the Connection Checker Bot! Please select an option:",
+        reply_markup=reply_markup
+    )
+    return ConversationHandler.END
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_text = (
+        "Available commands:\n"
+        "/start - Show main menu\n"
+        "/check <host> - Check all methods for a host\n"
+        "/direct <host> - Check direct connection\n"
+        "/ws <host> - Check WebSocket connection\n"
+        "/sni <host> - Check SNI\n"
+        "/proxy <host> - Check proxy connection\n"
+        "/v2ray <host> - Check V2Ray connection\n"
+        "/isp <host> - Get ISP information\n"
+        "/cancel - Cancel the current operation\n"
+        "/help - Show this help message"
+    )
+    await update.message.reply_text(help_text)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == 'help':
+        await help_command(update, context)
+        return ConversationHandler.END
+
+    await query.edit_message_text(f"You selected: {query.data.replace('_', ' ').title()}")
+    await query.message.reply_text("Please enter the host to check:")
+    context.user_data['check_type'] = query.data
+    return HOST
+
+async def host_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    host = update.message.text
+    context.user_data['host'] = host
+    check_type = context.user_data['check_type']
+
+    if check_type in ['proxy', 'v2ray']:
+        if check_type == 'proxy':
+            await update.message.reply_text("Please enter the proxy URL:")
+            return PROXY
+        else:
+            await update.message.reply_text("Please enter the V2Ray host:")
+            return V2RAY
+    else:
+        await perform_check(update, context)
+        return ConversationHandler.END
+
+async def proxy_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    proxy = update.message.text
+    context.user_data['proxy'] = proxy
+    await perform_check(update, context)
+    return ConversationHandler.END
+
+async def v2ray_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    v2ray_host = update.message.text
+    context.user_data['v2ray_host'] = v2ray_host
+    await update.message.reply_text("Please enter the V2Ray port:")
+    return V2RAY + 1
+
+async def v2ray_port_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v2ray_port = int(update.message.text)
+        context.user_data['v2ray_port'] = v2ray_port
+        await perform_check(update, context)
+    except ValueError:
+        await update.message.reply_text("Invalid port number. Please enter a valid integer.")
+    return ConversationHandler.END
+
+async def perform_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    host = context.user_data['host']
+    check_type = context.user_data['check_type']
+
+    try:
+        checker = ConnectionChecker(host)
+        if check_type == 'check_all':
+            results = {
+                'Direct': await checker.check_direct(),
+                'WebSocket': await checker.check_ws(),
+                'SNI': await checker.check_sni(),
+                'ISP': await checker.get_isp(),
+            }
+            if 'proxy' in context.user_data:
+                results['Proxy'] = await checker.check_proxy(context.user_data['proxy'])
+            if 'v2ray_host' in context.user_data and 'v2ray_port' in context.user_data:
+                results['V2Ray'] = await checker.check_v2ray(context.user_data['v2ray_host'], context.user_data['v2ray_port'])
+        elif check_type == 'direct':
+            results = {'Direct': await checker.check_direct()}
+        elif check_type == 'ws':
+            results = {'WebSocket': await checker.check_ws()}
+        elif check_type == 'sni':
+            results = {'SNI': await checker.check_sni()}
+        elif check_type == 'proxy':
+            results = {'Proxy': await checker.check_proxy(context.user_data['proxy'])}
+        elif check_type == 'v2ray':
+            results = {'V2Ray': await checker.check_v2ray(context.user_data['v2ray_host'], context.user_data['v2ray_port'])}
+        elif check_type == 'isp':
+            results = {'ISP': await checker.get_isp()}
+
+        await send_results(update, results)
+    except Exception as e:
+        logger.error(f"Error during check: {e}")
+        await update.message.reply_text(f"An error occurred: {str(e)}")
+
+async def send_results(update: Update, results: dict) -> None:
+    message = ""
+    for method, result in results.items():
+        if isinstance(result, tuple):
+            accessible, speed = result
+            status_message = 'Accessible' if accessible else 'Not Accessible'
+            speed_message = f" (Speed: {speed:.2f} seconds)" if speed is not None else ""
+            message += f"{method}: {status_message}{speed_message}\n"
+        else:
+            message += f"{method}: {result}\n"
+    await update.message.reply_text(message)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Operation cancelled. Type /start to begin a new check.")
+    return ConversationHandler.END
+
+def main() -> None:
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start), CallbackQueryHandler(button_handler)],
+        states={
+            HOST: [MessageHandler(filters.TEXT & ~filters.COMMAND, host_input)],
+            PROXY: [MessageHandler(filters.TEXT & ~filters.COMMAND, proxy_input)],
+            V2RAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, v2ray_input)],
+            V2RAY + 1: [MessageHandler(filters.TEXT & ~filters.COMMAND, v2ray_port_input)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("help", help_command))
+
+    logger.info("Starting bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
